@@ -665,12 +665,9 @@ impl VerilatorRuntime {
                 //    std::thread::current().id()
                 //)?;
 
-                THREAD_LOCKS_PER_BUILD_DIR
+                let thread_mutex = THREAD_LOCKS_PER_BUILD_DIR
                     .entry(local_artifacts_directory.clone())
                     .or_default();
-                let thread_mutex = THREAD_LOCKS_PER_BUILD_DIR
-                    .get(&local_artifacts_directory)
-                    .expect("We just inserted if it didn't exist");
 
                 let _thread_lock = if let Ok(_thread_lock) =
                     thread_mutex.try_lock()
