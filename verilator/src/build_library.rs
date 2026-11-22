@@ -21,7 +21,8 @@ use crate::{
     compute_wdata_word_count_from_width_not_msb,
     dpi::DpiFunction,
     ffi_names::{
-        self, DPI_INIT_CALLBACK, TRACE_EVER_ON, VCD_CLOSE_AND_DELETE, VCD_DUMP,
+        self, DELETE_CONTEXT, DPI_INIT_CALLBACK, NEW_CONTEXT,
+        SET_THREAD_CONTEXT, TRACE_EVER_ON, VCD_CLOSE_AND_DELETE, VCD_DUMP,
         VCD_FLUSH, VCD_OPEN_NEXT,
     },
     types,
@@ -35,8 +36,8 @@ fn build_ffi_for_tracing(
     writeln!(
         buffer,
         r#"
-    void {TRACE_EVER_ON}(bool everOn) {{
-        Verilated::traceEverOn(everOn);
+    void {TRACE_EVER_ON}(void* contextp, bool everOn) {{
+        static_cast<VerilatedContext*>(contextp)->traceEverOn(everOn);
     }}
 
     VerilatedVcdC* {open_trace}(V{top_module}* top, const char* path) {{
@@ -118,8 +119,20 @@ fn build_ffi(
 #include "V{top_module}.h"
 
 extern "C" {{
-    void* {new_top}() {{
-        return new V{top_module}{{}};
+    void* {NEW_CONTEXT}() {{
+        return new VerilatedContext{{}};
+    }}
+
+    void {DELETE_CONTEXT}(void* contextp) {{
+        delete static_cast<VerilatedContext*>(contextp);
+    }}
+
+    void {SET_THREAD_CONTEXT}(void* contextp) {{
+        Verilated::threadContextp(static_cast<VerilatedContext*>(contextp));
+    }}
+
+    void* {new_top}(void* contextp) {{
+        return new V{top_module}{{static_cast<VerilatedContext*>(contextp)}};
     }}
 
     

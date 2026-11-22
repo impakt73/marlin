@@ -8,6 +8,10 @@
 
 pub const DPI_INIT_CALLBACK: &str = "dpi_init_callback";
 
+pub const NEW_CONTEXT: &str = "ffi_new_context";
+pub const DELETE_CONTEXT: &str = "ffi_delete_context";
+pub const SET_THREAD_CONTEXT: &str = "ffi_set_thread_context";
+
 pub const TRACE_EVER_ON: &str = "ffi_Verilated_traceEverOn";
 
 pub fn open_trace(top_module: &str) -> String {
@@ -20,7 +24,7 @@ pub const VCD_FLUSH: &str = "ffi_VerilatedVcdC_flush";
 pub const VCD_CLOSE_AND_DELETE: &str = "ffi_VerilatedVcdC_close_and_delete";
 
 pub fn new_top(top_module: &str) -> String {
-    format!(" ffi_new_V{top_module}")
+    format!("ffi_new_V{top_module}")
 }
 
 pub fn top_eval(top_module: &str) -> String {

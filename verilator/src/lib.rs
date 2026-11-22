@@ -44,7 +44,10 @@ pub use dynamic::AsDynamicVerilatedModel;
 
 use crate::{
     dynamic::DynamicPortInfo,
-    ffi_names::{DPI_INIT_CALLBACK, TRACE_EVER_ON},
+    ffi_names::{
+        DELETE_CONTEXT, DPI_INIT_CALLBACK, NEW_CONTEXT, SET_THREAD_CONTEXT,
+        TRACE_EVER_ON,
+    },
 };
 
 /// Verilator-defined types for C FFI.
@@ -244,7 +247,11 @@ pub trait AsVerilatedModel<'ctx>: 'ctx {
     fn ports() -> &'static [(&'static str, usize, usize, PortDirection)];
 
     #[doc(hidden)]
-    fn init_from(library: &'ctx Library, tracing_enabled: bool) -> Self;
+    fn init_from(
+        library: &'ctx Library,
+        context: *mut ffi::c_void,
+        tracing_enabled: bool,
+    ) -> Self;
 
     #[doc(hidden)]
     unsafe fn model(&self) -> *mut ffi::c_void;
@@ -299,6 +306,32 @@ struct ModelDeallocator {
     deallocator: extern "C" fn(*mut ffi::c_void),
 }
 
+struct VerilatedLibrary {
+    library: Library,
+    context: *mut ffi::c_void,
+    delete_context: extern "C" fn(*mut ffi::c_void),
+    set_thread_context: extern "C" fn(*mut ffi::c_void),
+}
+
+// SAFETY: The context and library are owned by this entry and are not used
+// concurrently. Moving the owning runtime to another thread transfers that
+// ownership; Verilator contexts are not `Sync`, but they are safe to move as
+// long as they are not used from multiple threads at once.
+unsafe impl Send for VerilatedLibrary {}
+
+impl Drop for VerilatedLibrary {
+    fn drop(&mut self) {
+        if !self.context.is_null() {
+            // SAFETY: `context` was allocated by this library's
+            // `ffi_new_context` and is deleted exactly once here. Models that
+            // used it are deallocated by `VerilatorRuntime::drop` before the
+            // arena is dropped.
+            (self.delete_context)(self.context);
+            self.context = std::ptr::null_mut();
+        }
+    }
+}
+
 /// Runtime for (System)Verilog code.
 pub struct VerilatorRuntime {
     artifact_directory: Utf8PathBuf,
@@ -309,8 +342,9 @@ pub struct VerilatorRuntime {
     /// Mapping between hardware (top, path) and arena index of Verilator
     /// implementations.
     library_map: RefCell<HashMap<LibraryArenaKey, usize>>,
-    /// Verilator implementations arena.
-    library_arena: BoxcarVec<Library>,
+    /// Verilator implementations arena. Each entry owns the loaded library and
+    /// the explicit context used by all models constructed from it.
+    library_arena: BoxcarVec<VerilatedLibrary>,
     /// SAFETY: These are dropped when the runtime is dropped. They will not be
     /// "borrowed mutably" because the models created for this runtime must
     /// not outlive it and thus will be all gone before these are dropped.
@@ -343,14 +377,18 @@ static THREAD_LOCKS_PER_BUILD_DIR: LazyLock<
 /* </Forgive me father for I have sinned> */
 
 fn one_time_library_setup(
-    library: &Library,
+    library: &VerilatedLibrary,
     dpi_functions: &[&'static dyn DpiFunction],
     tracing_enabled: bool,
     options: &VerilatorRuntimeOptions,
 ) -> Result<(), Whatever> {
+    // Make the library's explicit context current on this thread before any
+    // setup callback that may fall back to Verilator's thread context.
+    (library.set_thread_context)(library.context);
+
     if !dpi_functions.is_empty() {
         let dpi_init_callback: extern "C" fn(*const *const ffi::c_void) =
-            *unsafe { library.get(DPI_INIT_CALLBACK.as_bytes()) }
+            *unsafe { library.library.get(DPI_INIT_CALLBACK.as_bytes()) }
                 .whatever_context("Failed to load DPI initializer")?;
 
         // order is important here. the function pointers will be
@@ -370,12 +408,12 @@ fn one_time_library_setup(
     }
 
     if tracing_enabled {
-        let trace_ever_on_callback: extern "C" fn(bool) =
-            *unsafe { library.get(TRACE_EVER_ON.as_bytes()) }
+        let trace_ever_on_callback: extern "C" fn(*mut ffi::c_void, bool) =
+            *unsafe { library.library.get(TRACE_EVER_ON.as_bytes()) }
                 .whatever_context(
                     "Model was not configured with tracing enabled",
                 )?;
-        trace_ever_on_callback(true);
+        trace_ever_on_callback(library.context, true);
 
         if options.log {
             log::info!("Initialized VCD tracing");
@@ -454,12 +492,23 @@ impl VerilatorRuntime {
                 "Failed to build or retrieve verilator dynamic library. Try removing the build directory if it is corrupted.",
             )?;
 
+        // Verilator falls back to the thread-local context in some helper
+        // paths, so make this library's explicit context current on this
+        // thread before constructing the model.
+        (library.set_thread_context)(library.context);
+
         let delete_model: extern "C" fn(*mut ffi::c_void) = *unsafe {
-            library.get(format!("ffi_delete_V{}", M::name()).as_bytes())
+            library
+                .library
+                .get(format!("ffi_delete_V{}", M::name()).as_bytes())
         }
         .expect("failed to get symbol");
 
-        let model = M::init_from(library, config.enable_tracing);
+        let model = M::init_from(
+            &library.library,
+            library.context,
+            config.enable_tracing,
+        );
 
         self.model_deallocators.borrow_mut().push(ModelDeallocator {
             // SAFETY: The `model` cannot outlive the runtime, and it is the
@@ -514,23 +563,31 @@ impl VerilatorRuntime {
                 "Failed to build or retrieve verilator dynamic library. Try removing the build directory if it is corrupted.",
             )?;
 
-        let new_main: extern "C" fn() -> *mut ffi::c_void =
-            *unsafe { library.get(format!("ffi_new_V{name}").as_bytes()) }
-                .whatever_context(format!(
-                    "Failed to load constructor for module {name}"
-                ))?;
-        let delete_main =
-            *unsafe { library.get(format!("ffi_delete_V{name}").as_bytes()) }
-                .whatever_context(format!(
-                "Failed to load destructor for module {name}"
-            ))?;
-        let eval_main =
-            *unsafe { library.get(format!("ffi_V{name}_eval").as_bytes()) }
-                .whatever_context(format!(
-                    "Failed to load evalulator for module {name}"
-                ))?;
+        (library.set_thread_context)(library.context);
 
-        let main = new_main();
+        let new_main: extern "C" fn(*mut ffi::c_void) -> *mut ffi::c_void =
+            *unsafe {
+                library.library.get(format!("ffi_new_V{name}").as_bytes())
+            }
+            .whatever_context(format!(
+                "Failed to load constructor for module {name}"
+            ))?;
+        let delete_main = *unsafe {
+            library
+                .library
+                .get(format!("ffi_delete_V{name}").as_bytes())
+        }
+        .whatever_context(format!(
+            "Failed to load destructor for module {name}"
+        ))?;
+        let eval_main = *unsafe {
+            library.library.get(format!("ffi_V{name}_eval").as_bytes())
+        }
+        .whatever_context(format!(
+            "Failed to load evalulator for module {name}"
+        ))?;
+
+        let main = new_main(library.context);
 
         let ports = ports
             .iter()
@@ -556,7 +613,7 @@ impl VerilatorRuntime {
             name: name.to_string(),
             main,
             eval_main,
-            library,
+            library: &library.library,
         })
     }
 
@@ -591,7 +648,7 @@ impl VerilatorRuntime {
         source_path: &str,
         ports: &[(&str, usize, usize, PortDirection)],
         config: &VerilatedModelConfig,
-    ) -> Result<&Library, Whatever> {
+    ) -> Result<&VerilatedLibrary, Whatever> {
         if name.chars().any(|c| c == '\\' || c == ' ') {
             whatever!("Escaped module names are not supported");
         }
@@ -756,6 +813,36 @@ impl VerilatorRuntime {
                     .whatever_context(
                         "Failed to load verilator dynamic library",
                     )?;
+
+                let new_context: extern "C" fn() -> *mut ffi::c_void =
+                    *unsafe { library.get(NEW_CONTEXT.as_bytes()) }
+                        .whatever_context(
+                            "Failed to load VerilatedContext constructor",
+                        )?;
+                let delete_context: extern "C" fn(*mut ffi::c_void) =
+                    *unsafe { library.get(DELETE_CONTEXT.as_bytes()) }
+                        .whatever_context(
+                            "Failed to load VerilatedContext destructor",
+                        )?;
+                let set_thread_context: extern "C" fn(*mut ffi::c_void) =
+                    *unsafe { library.get(SET_THREAD_CONTEXT.as_bytes()) }
+                        .whatever_context(
+                            "Failed to load VerilatedContext thread setter",
+                        )?;
+
+                let context = new_context();
+                if context.is_null() {
+                    whatever!(
+                        "Failed to allocate a VerilatedContext for module {name}"
+                    );
+                }
+
+                let library = VerilatedLibrary {
+                    library,
+                    context,
+                    delete_context,
+                    set_thread_context,
+                };
 
                 one_time_library_setup(
                     &library,

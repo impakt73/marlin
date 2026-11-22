@@ -99,10 +99,10 @@ pub fn build_verilated_struct(
     let mut dynamic_pin_arms = vec![];
 
     verilated_model_init_impl.push(quote! {
-        let new_model: extern "C" fn() -> *mut std::ffi::c_void =
+        let new_model: extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void =
             *unsafe { library.get(concat!("ffi_new_V", #top_name).as_bytes()) }
                 .expect("failed to get symbol");
-        let model = (new_model)();
+        let model = (new_model)(context);
 
         let eval_model: extern "C" fn(*mut std::ffi::c_void) =
             *unsafe { library.get(concat!("ffi_V", #top_name, "_eval").as_bytes()) }
@@ -388,7 +388,11 @@ pub fn build_verilated_struct(
                 &PORTS
             }
 
-            fn init_from(library: &'ctx #crate_name::__reexports::libloading::Library, tracing_enabled: bool) -> Self {
+            fn init_from(
+                library: &'ctx #crate_name::__reexports::libloading::Library,
+                context: *mut std::ffi::c_void,
+                tracing_enabled: bool,
+            ) -> Self {
                 #(#verilated_model_init_impl)*
 
                 let vcd_api =
