@@ -333,6 +333,15 @@ impl Drop for VerilatedLibrary {
 }
 
 /// Runtime for (System)Verilog code.
+///
+/// # Threading
+///
+/// A runtime and the models created from it must be used from one thread at a
+/// time. Dropping the runtime deletes its explicit `VerilatedContext` and then
+/// unloads the generated library, so the dropping thread must not use that
+/// library's Verilator APIs afterwards. Normal library unload makes this
+/// requirement unavoidable; runtimes should be dropped on the thread that owns
+/// them.
 pub struct VerilatorRuntime {
     artifact_directory: Utf8PathBuf,
     source_files: Vec<Utf8PathBuf>,
